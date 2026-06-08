@@ -4,7 +4,7 @@ import glob
 import cv2
 import numpy as np
 import logging
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,18 +25,9 @@ class LocalFaceIDMatcher:
     Class to perform local FaceID alignment, re-embedding, and matching 
     against a reference image for all clustered folders.
     """
-    def __init__(self, ref_image_path: str, model_root: str = ".", target_size: Optional[Tuple[int, int]] = None):
-        """
-        Initialize the matcher.
-        
-        Args:
-            ref_image_path: Path to reference image.
-            model_root: Root directory containing ONNX models.
-            target_size: Optional tuple (width, height) to resize reference image to match target resolution.
-        """
+    def __init__(self, ref_image_path: str, model_root: str = "."):
         self.ref_image_path = ref_image_path
         self.model_root = model_root
-        self.target_size = target_size
         self.app: Optional[FaceAnalysis] = None
         self.ref_embedding: Optional[np.ndarray] = None
         
@@ -63,22 +54,10 @@ class LocalFaceIDMatcher:
             img = cv2.imread(self.ref_image_path)
             if img is None:
                 raise FileNotFoundError(f"Could not read reference image: {self.ref_image_path}")
-            
-            # Downsample reference image to match cluster resolution if specified
-            if self.target_size:
-                logger.info(f"Resizing reference image to match cluster resolution: {self.target_size}")
-                img = cv2.resize(img, self.target_size, interpolation=cv2.INTER_LINEAR)
                 
-            # Apply padding to assist detector
-            padded_img = cv2.copyMakeBorder(
-                img, 50, 50, 50, 50, 
-                borderType=cv2.BORDER_CONSTANT, 
-                value=[0, 0, 0]
-            )
-            
-            faces = self.app.get(padded_img)
+            faces = self.app.get(img)
             if not faces:
-                raise ValueError("No face detected in reference image (even with padding)! Alignment failed.")
+                raise ValueError("No face detected in reference image! Alignment failed.")
                 
             # Pick largest face
             faces = sorted(faces, key=lambda x: (x.bbox[2]-x.bbox[0]) * (x.bbox[3]-x.bbox[1]), reverse=True)
@@ -223,28 +202,7 @@ def main():
     base_dir = "data"
     report_path = "data/local_face_id_report.md"
     
-    # Calculate average target size first
-    widths, heights = [], []
-    cluster_1_dir = os.path.join(base_dir, "cluster_1")
-    if os.path.exists(cluster_1_dir):
-        for p in glob.glob(os.path.join(cluster_1_dir, "*.jpg")):
-            img = cv2.imread(p)
-            if img is not None:
-                h, w = img.shape[:2]
-                widths.append(w)
-                heights.append(h)
-    
-    target_size = None
-    if widths:
-        avg_w = int(np.mean(widths))
-        avg_h = int(np.mean(heights))
-        target_size = (avg_w, avg_h)
-        logger.info(f"Calculated average target image size in cluster_1: {avg_w}x{avg_h}")
-    else:
-        target_size = (70, 80)
-        logger.info("Using default target image size: 70x80")
-        
-    matcher = LocalFaceIDMatcher(ref_image_path=ref_path, target_size=target_size)
+    matcher = LocalFaceIDMatcher(ref_image_path=ref_path)
     results = matcher.evaluate_clusters(base_dir)
     matcher.save_report(results, report_path)
 
