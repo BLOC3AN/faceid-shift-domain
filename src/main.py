@@ -6,12 +6,18 @@ from datetime import datetime
 from collections import defaultdict
 from dotenv import load_dotenv
 
-# Add src to python path if not already there
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Add project root and src to python path if not already there
+src_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(src_dir)
+if src_dir not in sys.path:
+    sys.path.append(src_dir)
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
 from qdrant_face_client import QdrantFaceClient
 from minio_face_client import MinioFaceClient
 from clustering import FaceClustering
+from utils.color_normalizer import FaceImageNormalizer
 
 # Load environment variables
 load_dotenv()
@@ -47,6 +53,25 @@ class FaceIDNormalizeApp:
         self.min_samples = int(os.getenv("HDBSCAN_MIN_SAMPLES", "1"))
         self.metric = os.getenv("HDBSCAN_METRIC", "euclidean")
         self.output_dir = output_dir
+        
+        # Load normalization settings
+        self.normalize_enabled = os.getenv("FACE_NORMALIZE_ENABLED", "0") == "1"
+        self.normalize_method = os.getenv("FACE_NORMALIZE_METHOD", "reinhard")
+        self.ref_image_path = os.getenv("FACE_REF_IMAGE_PATH", "data/_face_ID/duong.jpg")
+        self.normalize_overwrite = os.getenv("FACE_NORMALIZE_OVERWRITE", "1") == "1"
+        
+        # Initialize normalizer if enabled
+        self.normalizer = None
+        if self.normalize_enabled:
+            try:
+                self.normalizer = FaceImageNormalizer(
+                    method=self.normalize_method,
+                    reference_path=self.ref_image_path
+                )
+                logger.info("Face normalization is enabled and initialized successfully.")
+            except Exception as e:
+                logger.error(f"Failed to initialize FaceImageNormalizer: {e}. Normalization will be disabled.")
+                self.normalize_enabled = False
         
         # Initialize clients
         self.qdrant_client = QdrantFaceClient()
@@ -146,6 +171,26 @@ class FaceIDNormalizeApp:
                     success = self.minio_client.download_face_image(minio_url, dest_path)
                     if success:
                         total_downloaded += 1
+                        
+                        # Apply normalization if enabled
+                        if self.normalize_enabled and self.normalizer:
+                            if self.normalize_overwrite:
+                                # Overwrite the downloaded file
+                                if self.normalizer.transform_file(dest_path, dest_path):
+                                    logger.info(f"Normalized and overwrote image: {dest_path}")
+                                else:
+                                    logger.warning(f"Normalization failed to overwrite {dest_path}, keeping original.")
+                            else:
+                                # Save as a new file with suffix
+                                norm_filename = f"{short_id}_normalized_{filename}"
+                                norm_dest_path = os.path.join(cluster_path, norm_filename)
+                                if self.normalizer.transform_file(dest_path, norm_dest_path):
+                                    logger.info(f"Normalized image saved to: {norm_dest_path}")
+                                    # Update local_path to the normalized path
+                                    dest_path = norm_dest_path
+                                else:
+                                    logger.warning(f"Normalization failed for {dest_path}, keeping original.")
+                                    
                         item["local_path"] = dest_path
                         stats[cluster_dir_name]["items"].append(item)
                     else:
