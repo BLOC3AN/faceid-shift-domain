@@ -1,9 +1,14 @@
 import os
 import cv2
+import hashlib
 import numpy as np
 import logging
+import redis
 from typing import Dict, List, Any, Optional, Tuple
 from insightface.app import FaceAnalysis
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger("FaceClustering.FaceIDVerifier")
 
@@ -28,9 +33,80 @@ class FaceIDVerifier:
         
         self.app: Optional[FaceAnalysis] = None
         self.ref_embedding: Optional[np.ndarray] = None
+        self.redis_client: Optional[redis.Redis] = None
+        self.cache_key: Optional[str] = None
         
-        self._init_model()
-        self._extract_ref_embedding()
+        # Init Redis cache connection
+        self._init_redis()
+        
+        # Try loading cached embedding first (skip model init if hit)
+        cached = self._load_from_cache()
+        if cached is not None:
+            self.ref_embedding = cached
+            logger.info("✅ Reference embedding loaded from Redis cache (model init skipped).")
+        else:
+            logger.info("Cache miss — initializing model and extracting embedding...")
+            self._init_model()
+            self._extract_ref_embedding()
+            self._save_to_cache()
+
+    def _init_redis(self) -> None:
+        """Initialize Redis connection for embedding caching."""
+        try:
+            redis_password = os.getenv("REDIS_PASSWORD", "") or None
+            self.redis_client = redis.Redis(
+                host=os.getenv("REDIS_HOST", "localhost"),
+                port=int(os.getenv("REDIS_PORT", "6379")),
+                password=redis_password,
+                db=int(os.getenv("REDIS_DB", "0")),
+                socket_connect_timeout=3
+            )
+            self.redis_client.ping()
+            # Cache key based on ref image path hash
+            path_hash = hashlib.md5(self.ref_image_path.encode()).hexdigest()[:12]
+            self.cache_key = f"faceid:ref_embedding:{path_hash}"
+            logger.info(f"Redis cache connected. Key: {self.cache_key}")
+        except Exception as e:
+            logger.warning(f"Redis unavailable, caching disabled: {e}")
+            self.redis_client = None
+
+    def _load_from_cache(self) -> Optional[np.ndarray]:
+        """Try loading reference embedding from Redis cache."""
+        if not self.redis_client or not self.cache_key:
+            return None
+        try:
+            data = self.redis_client.get(self.cache_key)
+            if data is not None:
+                embedding = np.frombuffer(data, dtype=np.float32).copy()
+                logger.info(f"Cache hit: loaded embedding ({embedding.shape}) from Redis.")
+                return embedding
+            logger.info("Cache miss: no cached embedding found.")
+        except Exception as e:
+            logger.warning(f"Failed to load from Redis cache: {e}")
+        return None
+
+    def _save_to_cache(self) -> None:
+        """Save reference embedding to Redis cache."""
+        if not self.redis_client or not self.cache_key or self.ref_embedding is None:
+            return
+        try:
+            self.redis_client.set(self.cache_key, self.ref_embedding.astype(np.float32).tobytes())
+            logger.info(f"Reference embedding cached to Redis: {self.cache_key}")
+        except Exception as e:
+            logger.warning(f"Failed to save to Redis cache: {e}")
+
+    def clear_cache(self) -> None:
+        """Delete cached embedding from Redis (call after successful pipeline)."""
+        if not self.redis_client or not self.cache_key:
+            return
+        try:
+            deleted = self.redis_client.delete(self.cache_key)
+            if deleted:
+                logger.info(f"Redis cache cleared: {self.cache_key}")
+            else:
+                logger.debug(f"No cache entry to clear: {self.cache_key}")
+        except Exception as e:
+            logger.warning(f"Failed to clear Redis cache: {e}")
 
     def _init_model(self) -> None:
         """Initialize local InsightFace models for the reference image only."""

@@ -323,7 +323,12 @@ class FaceIDNormalizeApp:
                     logger.info(f"Matched images copied to: {match_dest_dir}")
             logger.info("==========================================================")
             
+            # Pipeline completed successfully — clear Redis embedding cache
+            if self.verify_enabled and self.verifier:
+                self.verifier.clear_cache()
+            
         except Exception as e:
+            # Pipeline failed — cache is preserved for faster next run
             logger.error(f"Critical error in main pipeline: {e}", exc_info=True)
             raise
 
