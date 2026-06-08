@@ -72,8 +72,8 @@ class FaceIDVerifier:
     def _init_model(self) -> None:
         """Initialize local InsightFace models for the reference image only."""
         try:
-            logger.info("Initializing FaceAnalysis for reference image extraction...")
-            self.app = FaceAnalysis(name='buffalo_m', root=self.model_root)
+            logger.info("Initializing FaceAnalysis (only detection and recognition) for reference image extraction...")
+            self.app = FaceAnalysis(name='buffalo_m', root=self.model_root, allowed_modules=['detection', 'recognition'])
             self.app.prepare(ctx_id=-1, det_size=(640, 640))
             logger.info("FaceAnalysis initialized successfully.")
         except Exception as e:
