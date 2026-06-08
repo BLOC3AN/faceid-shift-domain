@@ -1,5 +1,4 @@
 import os
-import shutil
 import cv2
 import numpy as np
 import logging
@@ -10,8 +9,8 @@ logger = logging.getLogger("FaceClustering.FaceIDVerifier")
 
 class FaceIDVerifier:
     """
-    Handles FaceID matching and domain shift calibration directly using
-    pre-extracted vectors fetched from Qdrant, avoiding expensive local re-embedding.
+    Handles pure mathematical FaceID matching and domain shift calibration
+    directly on pre-extracted vectors, separating vector math from disk I/O.
     """
     def __init__(
         self, 
@@ -77,23 +76,28 @@ class FaceIDVerifier:
             return 0.0
         return float(dot_product / (norm_v1 * norm_v2))
 
-    def verify_vectors(self, clustered_items: Dict[str, List[Dict[str, Any]]], base_data_dir: str) -> Dict[str, Any]:
+    def verify_vectors(self, clusters: Dict[int, List[Dict[str, Any]]]) -> Dict[str, Any]:
         """
-        Runs verification directly on the provided Qdrant vectors.
+        Runs verification directly on the provided cluster embeddings in RAM.
         
         Args:
-            clustered_items: Dict mapping folder_name -> list of item dicts containing:
-                             - "point_id"
-                             - "vector"
-                             - "local_path"
-                             - "minio_url"
-            base_data_dir: Output base directory.
+            clusters: Dict mapping label (int) -> list of item dicts containing:
+                      - "point_id"
+                      - "vector"
+        
+        Returns:
+            Dict containing:
+                - "target_folder": Name of the folder representing the target cluster (e.g. 'cluster_1')
+                - "delta_v_norm": Norm of the calculated translation vector
+                - "matches_count": Total count of verified matches
+                - "results": Dict mapping point_id -> {"similarity": float, "is_match": bool}
         """
-        logger.info("Running FaceID verification directly on Qdrant vectors...")
+        logger.info("Running FaceID verification directly on Qdrant vectors in RAM...")
         
         # Calculate raw similarities for all clusters
         raw_similarities = {}
-        for folder_name, items in clustered_items.items():
+        for label, items in clusters.items():
+            folder_name = "noise" if label == -1 else f"cluster_{label}"
             raw_similarities[folder_name] = []
             for item in items:
                 emb = np.array(item["vector"])
@@ -103,6 +107,7 @@ class FaceIDVerifier:
                 
         # Identify target cluster (highest raw average similarity, excluding noise)
         target_folder = None
+        target_label = None
         highest_avg_sim = -1.0
         
         for folder_name, sims in raw_similarities.items():
@@ -113,12 +118,14 @@ class FaceIDVerifier:
             if avg_sim > highest_avg_sim:
                 highest_avg_sim = avg_sim
                 target_folder = folder_name
+                # Extract label from folder name (e.g. 'cluster_1' -> 1)
+                target_label = int(folder_name.split("_")[1])
                 
         # Calculate translation vector delta_v
         delta_v = None
-        if self.calibration_enabled and target_folder:
+        if self.calibration_enabled and target_label is not None:
             logger.info(f"Target cluster identified: '{target_folder}' with average similarity {highest_avg_sim:.4f}")
-            target_embs = [np.array(x["vector"]) for x in clustered_items[target_folder]]
+            target_embs = [np.array(x["vector"]) for x in clusters[target_label]]
             target_embs_norm = [x / np.linalg.norm(x) for x in target_embs]
             centroid = np.mean(target_embs_norm, axis=0)
             centroid = centroid / np.linalg.norm(centroid)
@@ -128,19 +135,12 @@ class FaceIDVerifier:
             logger.info("Domain calibration is disabled or no valid target cluster was found.")
 
         # Evaluate final calibrated similarities
-        verified_results = {}
+        results_map = {}
         matches_count = 0
         
-        # Prepare match destination directory
-        ref_basename = os.path.splitext(os.path.basename(self.ref_image_path))[0]
-        match_dest_dir = os.path.join(base_data_dir, "matches", ref_basename)
-        if os.path.exists(match_dest_dir):
-            shutil.rmtree(match_dest_dir)
-        os.makedirs(match_dest_dir, exist_ok=True)
-
-        for folder_name, items in clustered_items.items():
-            verified_results[folder_name] = []
+        for label, items in clusters.items():
             for item in items:
+                point_id = item["point_id"]
                 emb = np.array(item["vector"])
                 norm_emb = emb / np.linalg.norm(emb)
                 
@@ -153,28 +153,19 @@ class FaceIDVerifier:
                     sim = self.cosine_similarity(self.ref_embedding, norm_emb)
                     
                 is_match = sim >= self.verify_threshold
-                item_result = {
-                    "filename": os.path.basename(item["local_path"]),
-                    "path": item["local_path"],
+                if is_match:
+                    matches_count += 1
+                    
+                results_map[point_id] = {
                     "similarity": sim,
                     "is_match": is_match
                 }
-                verified_results[folder_name].append(item_result)
                 
-                if is_match and os.path.exists(item["local_path"]):
-                    matches_count += 1
-                    # Copy to matches folder
-                    shutil.copy2(item["local_path"], os.path.join(match_dest_dir, os.path.basename(item["local_path"])))
-                    
-            # Sort results by similarity descending
-            verified_results[folder_name] = sorted(verified_results[folder_name], key=lambda x: x["similarity"], reverse=True)
-            
-        logger.info(f"Verification completed. Total matches found: {matches_count}. Matched images copied to '{match_dest_dir}'.")
+        logger.info(f"Verification mathematical analysis completed. Total matches found: {matches_count}.")
         
         return {
             "target_folder": target_folder,
             "delta_v_norm": float(np.linalg.norm(delta_v)) if delta_v is not None else 0.0,
-            "results": verified_results,
-            "matches_count": matches_count,
-            "match_dest_dir": match_dest_dir
+            "results": results_map,
+            "matches_count": matches_count
         }

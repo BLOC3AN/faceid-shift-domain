@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import logging
 import json
 from datetime import datetime
@@ -24,7 +25,7 @@ from face_id_verifier import FaceIDVerifier
 # Load environment variables
 load_dotenv()
 
-# Configure logging to both console and a log file in output directory
+# Configure logging
 output_dir = os.getenv("OUTPUT_DATA_DIR", "data")
 os.makedirs(output_dir, exist_ok=True)
 
@@ -44,9 +45,9 @@ class FaceIDNormalizeApp:
     Unified Application class that orchestrates:
     1. Fetching face embeddings from Qdrant.
     2. Clustering them using HDBSCAN.
-    3. Downloading the images from MinIO.
-    4. Normalizing color space & color distribution of the images.
-    5. Performing local alignment, re-embedding, and domain shift calibrated FaceID verification.
+    3. Mathematical FaceID verification and domain calibration in RAM.
+    4. Selective lazy loading of images from MinIO based on matches and configs.
+    5. Reinhard color normalization on downloaded images.
     """
     def __init__(self):
         logger.info("Initializing FaceID Normalize Application...")
@@ -68,6 +69,10 @@ class FaceIDNormalizeApp:
         self.verify_threshold = float(os.getenv("FACE_VERIFY_THRESHOLD", "0.65"))
         self.verify_calibration_enabled = os.getenv("FACE_VERIFY_CALIBRATION_ENABLED", "0") == "1"
         self.verify_calibration_alpha = float(os.getenv("FACE_VERIFY_CALIBRATION_ALPHA", "0.6"))
+        
+        # Load download mode setting
+        self.download_mode = os.getenv("DOWNLOAD_IMAGES_MODE", "all")
+        logger.info(f"Image download mode configured as: {self.download_mode}")
         
         # Initialize normalizer if enabled
         self.normalizer = None
@@ -119,7 +124,7 @@ class FaceIDNormalizeApp:
                 logger.warning("No face embeddings found in Qdrant database. Exiting pipeline.")
                 return
             
-            # 2. Extract vectors and keep map of index -> point metadata
+            # 2. Filter points that have a valid minio_url
             embeddings = []
             valid_points = []
             
@@ -141,8 +146,7 @@ class FaceIDNormalizeApp:
             # 3. Perform clustering
             labels, probabilities = self.clustering_engine.run(embeddings)
             
-            # 4. Process cluster results and organize files
-            logger.info("Organizing images into cluster directories...")
+            # 4. Group points by their cluster labels
             clusters = defaultdict(list)
             for idx, label in enumerate(labels):
                 clusters[int(label)].append({
@@ -153,15 +157,28 @@ class FaceIDNormalizeApp:
                     "vector": valid_points[idx]["vector"]
                 })
             
-            # Create directories and download files
+            # 5. Perform Face ID verification *first* on vectors in RAM
+            verification_stats = None
+            if self.verify_enabled and self.verifier:
+                verification_stats = self.verifier.verify_vectors(clusters)
+                
+            # Prepare matches destination directory
+            match_dest_dir = None
+            if verification_stats:
+                ref_basename = os.path.splitext(os.path.basename(self.ref_image_path))[0]
+                match_dest_dir = os.path.join(self.output_dir, "matches", ref_basename)
+                if os.path.exists(match_dest_dir):
+                    shutil.rmtree(match_dest_dir)
+                os.makedirs(match_dest_dir, exist_ok=True)
+            
+            # 6. Process cluster results and selectively download files
+            logger.info("Organizing images and downloading selectively...")
             stats = {}
             total_downloaded = 0
             total_failed = 0
             
             for label, cluster_points in sorted(clusters.items()):
                 cluster_dir_name = "noise" if label == -1 else f"cluster_{label}"
-                logger.info(f"Processing {cluster_dir_name} ({len(cluster_points)} images)...")
-                
                 cluster_path = os.path.join(self.output_dir, cluster_dir_name)
                 os.makedirs(cluster_path, exist_ok=True)
                 
@@ -171,44 +188,60 @@ class FaceIDNormalizeApp:
                 }
                 
                 for item in cluster_points:
+                    point_id = item["point_id"]
                     minio_url = item["minio_url"]
-                    _, object_name = self.minio_client.parse_minio_url(minio_url)
-                    filename = object_name.split('/')[-1]
                     
-                    short_id = str(item["point_id"])[:8]
-                    dest_filename = f"{short_id}_{filename}"
-                    dest_path = os.path.join(cluster_path, dest_filename)
-                    
-                    # Download image
-                    success = self.minio_client.download_face_image(minio_url, dest_path)
-                    if success:
-                        total_downloaded += 1
+                    # Check match status
+                    is_match = False
+                    if verification_stats and point_id in verification_stats["results"]:
+                        is_match = verification_stats["results"][point_id]["is_match"]
                         
-                        # Apply color normalization if enabled
-                        if self.normalize_enabled and self.normalizer:
-                            if self.normalize_overwrite:
-                                if self.normalizer.transform_file(dest_path, dest_path):
-                                    logger.info(f"Normalized and overwrote image: {dest_path}")
-                            else:
-                                norm_filename = f"{short_id}_normalized_{filename}"
-                                norm_dest_path = os.path.join(cluster_path, norm_filename)
-                                if self.normalizer.transform_file(dest_path, norm_dest_path):
-                                    logger.info(f"Normalized image saved to: {norm_dest_path}")
-                                    dest_path = norm_dest_path
-                                    
-                        item["local_path"] = dest_path
-                        stats[cluster_dir_name]["items"].append(item)
-                    else:
-                        total_failed += 1
+                    # Decide if we need to download
+                    should_download = False
+                    if self.download_mode == "all":
+                        should_download = True
+                    elif self.download_mode == "matched_only":
+                        should_download = is_match
+                    # 'none' mode means should_download remains False
+                    
+                    item["local_path"] = None
+                    
+                    if should_download:
+                        _, object_name = self.minio_client.parse_minio_url(minio_url)
+                        filename = object_name.split('/')[-1]
+                        
+                        short_id = str(point_id)[:8]
+                        dest_filename = f"{short_id}_{filename}"
+                        dest_path = os.path.join(cluster_path, dest_filename)
+                        
+                        # Download image
+                        success = self.minio_client.download_face_image(minio_url, dest_path)
+                        if success:
+                            total_downloaded += 1
+                            
+                            # Apply color normalization if enabled
+                            if self.normalize_enabled and self.normalizer:
+                                if self.normalize_overwrite:
+                                    if self.normalizer.transform_file(dest_path, dest_path):
+                                        logger.info(f"Normalized and overwrote image: {dest_path}")
+                                else:
+                                    norm_filename = f"{short_id}_normalized_{filename}"
+                                    norm_dest_path = os.path.join(cluster_path, norm_filename)
+                                    if self.normalizer.transform_file(dest_path, norm_dest_path):
+                                        logger.info(f"Normalized image saved to: {norm_dest_path}")
+                                        dest_path = norm_dest_path
+                                        
+                            item["local_path"] = dest_path
+                            
+                            # Copy to matches folder if it is a match
+                            if is_match and match_dest_dir:
+                                shutil.copy2(dest_path, os.path.join(match_dest_dir, os.path.basename(dest_path)))
+                        else:
+                            total_failed += 1
+                            
+                    stats[cluster_dir_name]["items"].append(item)
             
-            # 5. Perform Face ID verification if enabled
-            verification_stats = None
-            if self.verify_enabled and self.verifier:
-                # Prepare verification dict: folder_name -> list of items
-                verification_items = {k: v["items"] for k, v in stats.items()}
-                verification_stats = self.verifier.verify_vectors(verification_items, self.output_dir)
-                
-            # 6. Generate final reports
+            # 7. Generate final reports
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
             
@@ -221,7 +254,8 @@ class FaceIDNormalizeApp:
             logger.info(f"Clusters found: {len(clusters) - (1 if -1 in clusters else 0)}")
             if verification_stats:
                 logger.info(f"FaceID Verification Matches: {verification_stats['matches_count']}")
-                logger.info(f"Matched images copied to: {verification_stats['match_dest_dir']}")
+                if match_dest_dir and os.path.exists(match_dest_dir):
+                    logger.info(f"Matched images copied to: {match_dest_dir}")
             logger.info("==========================================================")
             
         except Exception as e:
@@ -248,7 +282,8 @@ class FaceIDNormalizeApp:
                 "timestamp": datetime.now().isoformat(),
                 "duration_seconds": duration,
                 "downloaded": downloaded,
-                "failed": failed
+                "failed": failed,
+                "download_mode": self.download_mode
             }
         }
         try:
@@ -263,6 +298,7 @@ class FaceIDNormalizeApp:
                 f.write("# Báo Cáo Kết Quả Phân Cụm & Đối Khớp FaceID\n\n")
                 f.write(f"- **Thời gian chạy**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"- **Thời gian xử lý**: {duration:.2f} giây\n")
+                f.write(f"- **Chế độ tải ảnh**: `{self.download_mode}`\n")
                 f.write(f"- **Tổng số ảnh tải thành công**: {downloaded}\n")
                 f.write(f"- **Số ảnh lỗi**: {failed}\n")
                 f.write(f"- **Cấu hình HDBSCAN**:\n")
@@ -279,27 +315,34 @@ class FaceIDNormalizeApp:
                     f.write(f"- **Hệ số hiệu chỉnh tịnh tiến ($\alpha$)**: {self.verify_calibration_alpha}\n")
                     f.write(f"- **Ngưỡng nhận diện đối khớp**: {self.verify_threshold}\n")
                     f.write(f"- **Tổng số ảnh trùng khớp tìm thấy**: **{verification_stats['matches_count']}**\n")
-                    f.write(f"- **Thư mục lưu ảnh khớp**: `data/matches/{os.path.splitext(os.path.basename(self.ref_image_path))[0]}/`\n\n")
+                    if self.download_mode != "none":
+                        f.write(f"- **Thư mục lưu ảnh khớp**: `data/matches/{os.path.splitext(os.path.basename(self.ref_image_path))[0]}/`\n\n")
+                    else:
+                        f.write("- **Thư mục lưu ảnh khớp**: `N/A` (Chế độ `none` không tải ảnh)\n\n")
                     
                     # Top 10 matches table
                     f.write("### Top 10 Ảnh Có Độ Tương Đồng Cao Nhất Sau Hiệu Chỉnh\n\n")
-                    f.write("| # | Cụm | Tên File | Độ Tương Đồng | Trạng Thái |\n")
-                    f.write("| :---: | :---: | :--- | :---: | :---: |")
+                    f.write("| # | Cụm | Point ID | Tên File Local | Độ Tương Đồng | Trạng Thái |\n")
+                    f.write("| :---: | :---: | :--- | :--- | :---: | :---: |")
                     
                     all_matched_items = []
-                    for folder, items in verification_stats["results"].items():
-                        for item in items:
+                    for folder_name, info in stats.items():
+                        for item in info["items"]:
+                            point_id = item["point_id"]
+                            res = verification_stats["results"].get(point_id, {"similarity": 0.0, "is_match": False})
                             all_matched_items.append({
-                                "folder": folder,
-                                "filename": item["filename"],
-                                "similarity": item["similarity"],
-                                "is_match": item["is_match"]
+                                "folder": folder_name,
+                                "point_id": point_id,
+                                "local_path": item["local_path"],
+                                "similarity": res["similarity"],
+                                "is_match": res["is_match"]
                             })
                     all_matched_items = sorted(all_matched_items, key=lambda x: x["similarity"], reverse=True)
                     
                     for idx, item in enumerate(all_matched_items[:10]):
                         status = "✅ KHỚP (Duong)" if item["is_match"] else "❌ KHÔNG KHỚP"
-                        f.write(f"\n| {idx+1} | `{item['folder']}` | `{item['filename']}` | {item['similarity']:.4f} | {status} |")
+                        filename = os.path.basename(item["local_path"]) if item["local_path"] else "Not Downloaded"
+                        f.write(f"\n| {idx+1} | `{item['folder']}` | `{item['point_id'][:8]}` | `{filename}` | {item['similarity']:.4f} | {status} |")
                     f.write("\n\n")
                 
                 # Clustering statistics section
@@ -320,7 +363,11 @@ class FaceIDNormalizeApp:
                         
                     f.write(f"| `{folder_name}` | {info['count']} | {status} |")
                     if verification_stats:
-                        folder_matches = sum(1 for x in verification_stats["results"].get(folder_name, []) if x["is_match"])
+                        folder_matches = 0
+                        for item in info["items"]:
+                            pid = item["point_id"]
+                            if verification_stats["results"].get(pid, {}).get("is_match", False):
+                                folder_matches += 1
                         f.write(f" {folder_matches} |")
                     f.write("\n")
                 
@@ -339,16 +386,12 @@ class FaceIDNormalizeApp:
                         f.write(" :---: | :---: |")
                     f.write(" :--- |\n")
                     
-                    # Create lookup for verification similarity
-                    ver_map = {}
-                    if verification_stats:
-                        ver_map = {x["filename"]: x for x in verification_stats["results"].get(folder_name, [])}
-                        
                     for item in info["items"]:
-                        filename = os.path.basename(item["local_path"])
-                        f.write(f"| `{item['point_id']}` | `{filename}` |")
+                        point_id = item["point_id"]
+                        filename = os.path.basename(item["local_path"]) if item["local_path"] else "Not Downloaded"
+                        f.write(f"| `{point_id}` | `{filename}` |")
                         if verification_stats:
-                            res = ver_map.get(filename, {"similarity": 0.0, "is_match": False})
+                            res = verification_stats["results"].get(point_id, {"similarity": 0.0, "is_match": False})
                             status = "Match" if res["is_match"] else "No Match"
                             f.write(f" {res['similarity']:.4f} | {status} |")
                         f.write(f" [Link]({item['minio_url']}) |\n")
