@@ -21,6 +21,7 @@ if project_root not in sys.path:
 
 from qdrant_face_client import QdrantFaceClient
 from minio_face_client import MinioFaceClient
+from redis_client import RedisCacheClient
 from clustering import FaceClustering
 from utils.color_normalizer import FaceImageNormalizer
 from face_id_verifier import FaceIDVerifier
@@ -92,7 +93,10 @@ class FaceIDNormalizeApp:
                 logger.error(f"Failed to initialize normalizer: {e}. Normalization disabled.")
                 self.normalize_enabled = False
                 
-        # Initialize verifier if enabled
+        # Initialize shared Redis client
+        self.redis_client = RedisCacheClient()
+        
+        # Initialize verifier if enabled (inject Redis client)
         self.verifier = None
         if self.verify_enabled:
             try:
@@ -101,7 +105,8 @@ class FaceIDNormalizeApp:
                     model_root=".",
                     verify_threshold=self.verify_threshold,
                     calibration_enabled=self.verify_calibration_enabled,
-                    calibration_alpha=self.verify_calibration_alpha
+                    calibration_alpha=self.verify_calibration_alpha,
+                    redis_client=self.redis_client
                 )
                 logger.info("Local FaceID verifier initialized successfully.")
             except Exception as e:
@@ -136,6 +141,9 @@ class FaceIDNormalizeApp:
             short_id = str(point_id)[:8]
             dest_filename = f"{short_id}_{filename}"
             dest_path = os.path.join(cluster_path, dest_filename)
+            
+            # Lazy directory creation (only when actually downloading)
+            os.makedirs(cluster_path, exist_ok=True)
             
             # Download to memory (avoid intermediate disk write)
             data = self.minio_client.download_to_memory(minio_url)
@@ -248,7 +256,6 @@ class FaceIDNormalizeApp:
                 for label, cluster_points in sorted(clusters.items()):
                     cluster_dir_name = "noise" if label == -1 else f"cluster_{label}"
                     cluster_path = os.path.join(self.output_dir, cluster_dir_name)
-                    os.makedirs(cluster_path, exist_ok=True)
                     
                     stats[cluster_dir_name] = {"count": len(cluster_points), "items": []}
                     
