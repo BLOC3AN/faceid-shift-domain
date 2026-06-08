@@ -312,11 +312,14 @@ class FaceIDNormalizeApp:
                         item["local_path"] = None
                         stats[cluster_dir_name]["items"].append(item)
             
-            # 7. Generate final reports
+            # 7. Generate final reports (only when downloading — analysis-only mode logs results)
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
             
-            self._generate_report(stats, verification_stats, duration, total_downloaded, total_failed)
+            if self.download_images:
+                self._generate_report(stats, verification_stats, duration, total_downloaded, total_failed)
+            else:
+                logger.info("Report generation skipped (DOWNLOAD_IMAGES=0, results in log only).")
             
             logger.info("==========================================================")
             logger.info(f"Pipeline finished successfully in {duration:.2f} seconds.")
