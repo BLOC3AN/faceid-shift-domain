@@ -149,7 +149,8 @@ class FaceIDNormalizeApp:
                     "point_id": valid_points[idx]["id"],
                     "minio_url": valid_points[idx]["payload"]["minio_url"],
                     "payload": valid_points[idx]["payload"],
-                    "probability": float(probabilities[idx])
+                    "probability": float(probabilities[idx]),
+                    "vector": valid_points[idx]["vector"]
                 })
             
             # Create directories and download files
@@ -203,7 +204,9 @@ class FaceIDNormalizeApp:
             # 5. Perform Face ID verification if enabled
             verification_stats = None
             if self.verify_enabled and self.verifier:
-                verification_stats = self.verifier.run_verification(self.output_dir)
+                # Prepare verification dict: folder_name -> list of items
+                verification_items = {k: v["items"] for k, v in stats.items()}
+                verification_stats = self.verifier.verify_vectors(verification_items, self.output_dir)
                 
             # 6. Generate final reports
             end_time = datetime.now()
