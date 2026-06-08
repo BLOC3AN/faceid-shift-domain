@@ -18,7 +18,7 @@ def cosine_similarity(v1, v2):
     return float(dot_product / (norm_v1 * norm_v2))
 
 def main():
-    ref_path = "data/_face_ID/duong.jpg"
+    ref_path = "data/_face_ID/duong_cropped.jpg"
     target_path = "data/cluster_1/6627b526_face_20260605_101942_id1_conf0.99.jpg"
     
     if not os.path.exists(ref_path):
@@ -42,7 +42,7 @@ def main():
     ref_embedding = ref_faces[0].embedding
     
     # Extract target image embedding (Normalized on disk)
-    print("Extracting embedding for target image from disk (CLAHE Normalized)...")
+    print("Extracting embedding for target image from disk (Normalized)...")
     target_img = cv2.imread(target_path)
     target_faces = app.get(target_img)
     if not target_faces:
@@ -77,7 +77,7 @@ def main():
         print(f"- Original Similarity (Qdrant - Un-normalized): {sim_original:.4f}")
     else:
         print("- Original Similarity (Qdrant): Not found in DB")
-    print(f"- Current Similarity (Local Disk - CLAHE Normalized): {sim_normalized:.4f}")
+    print(f"- Current Similarity (Local Disk - Normalized): {sim_normalized:.4f}")
     print("="*60)
 
 if __name__ == "__main__":
