@@ -3,9 +3,12 @@ import sys
 import shutil
 import logging
 import json
+import cv2
+import numpy as np
 from datetime import datetime
 from collections import defaultdict
 from typing import Optional, Dict, List, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 # Add src directory to python path
@@ -70,9 +73,11 @@ class FaceIDNormalizeApp:
         self.verify_calibration_enabled = os.getenv("FACE_VERIFY_CALIBRATION_ENABLED", "0") == "1"
         self.verify_calibration_alpha = float(os.getenv("FACE_VERIFY_CALIBRATION_ALPHA", "0.6"))
         
-        # Load download mode setting
+        # Load download settings
+        self.download_images = os.getenv("DOWNLOAD_IMAGES", "1") == "1"
         self.download_mode = os.getenv("DOWNLOAD_IMAGES_MODE", "all")
-        logger.info(f"Image download mode configured as: {self.download_mode}")
+        self.max_workers = int(os.getenv("MAX_DOWNLOAD_WORKERS", "8"))
+        logger.info(f"Download: enabled={self.download_images}, mode={self.download_mode}, workers={self.max_workers}")
         
         # Initialize normalizer if enabled
         self.normalizer = None
@@ -111,6 +116,65 @@ class FaceIDNormalizeApp:
             min_samples=self.min_samples,
             metric=self.metric
         )
+
+    def _download_and_process_item(
+        self, item: dict, cluster_path: str, is_match: bool, match_dest_dir: Optional[str]
+    ) -> tuple:
+        """
+        Download image to memory, normalize in-memory, write once to disk.
+        Thread-safe — each call operates on independent file paths.
+        
+        Returns:
+            tuple: (dest_path: str or None, success: bool)
+        """
+        minio_url = item["minio_url"]
+        point_id = item["point_id"]
+        
+        try:
+            _, object_name = self.minio_client.parse_minio_url(minio_url)
+            filename = object_name.split('/')[-1]
+            short_id = str(point_id)[:8]
+            dest_filename = f"{short_id}_{filename}"
+            dest_path = os.path.join(cluster_path, dest_filename)
+            
+            # Download to memory (avoid intermediate disk write)
+            data = self.minio_client.download_to_memory(minio_url)
+            if data is None:
+                return None, False
+            
+            # Decode image in memory
+            img_array = np.frombuffer(data, np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            if img is None:
+                logger.error(f"Failed to decode image from {minio_url}")
+                return None, False
+            
+            # Apply normalization in memory if enabled
+            if self.normalize_enabled and self.normalizer:
+                normalized_img = self.normalizer.transform(img)
+                if self.normalize_overwrite:
+                    # Write normalized directly (1 disk write total)
+                    cv2.imwrite(dest_path, normalized_img)
+                else:
+                    # Write original + normalized separately
+                    cv2.imwrite(dest_path, img)
+                    norm_filename = f"{short_id}_normalized_{filename}"
+                    norm_dest_path = os.path.join(cluster_path, norm_filename)
+                    cv2.imwrite(norm_dest_path, normalized_img)
+                    dest_path = norm_dest_path
+            else:
+                # No normalization — write decoded image once
+                cv2.imwrite(dest_path, img)
+            
+            # Copy to matches folder if matched
+            if is_match and match_dest_dir:
+                shutil.copy2(dest_path, os.path.join(match_dest_dir, os.path.basename(dest_path)))
+            
+            return dest_path, True
+            
+        except Exception as e:
+            logger.error(f"Failed to process item {item.get('point_id', 'unknown')}: {e}")
+            return None, False
 
     def run(self):
         """Execute the entire pipeline."""
@@ -157,89 +221,89 @@ class FaceIDNormalizeApp:
                     "vector": valid_points[idx]["vector"]
                 })
             
-            # 5. Perform Face ID verification *first* on vectors in RAM
+            # 5. Perform Face ID verification on vectors in RAM (vectorized numpy)
             verification_stats = None
             if self.verify_enabled and self.verifier:
                 verification_stats = self.verifier.verify_vectors(clusters)
                 
-            # Prepare matches destination directory
-            match_dest_dir = None
-            if verification_stats:
-                ref_basename = os.path.splitext(os.path.basename(self.ref_image_path))[0]
-                match_dest_dir = os.path.join(self.output_dir, "matches", ref_basename)
-                if os.path.exists(match_dest_dir):
-                    shutil.rmtree(match_dest_dir)
-                os.makedirs(match_dest_dir, exist_ok=True)
-            
             # 6. Process cluster results and selectively download files
-            logger.info("Organizing images and downloading selectively...")
             stats = {}
             total_downloaded = 0
             total_failed = 0
+            match_dest_dir = None
             
-            for label, cluster_points in sorted(clusters.items()):
-                cluster_dir_name = "noise" if label == -1 else f"cluster_{label}"
-                cluster_path = os.path.join(self.output_dir, cluster_dir_name)
-                os.makedirs(cluster_path, exist_ok=True)
+            if self.download_images:
+                # Prepare matches destination directory
+                if verification_stats:
+                    ref_basename = os.path.splitext(os.path.basename(self.ref_image_path))[0]
+                    match_dest_dir = os.path.join(self.output_dir, "matches", ref_basename)
+                    if os.path.exists(match_dest_dir):
+                        shutil.rmtree(match_dest_dir)
+                    os.makedirs(match_dest_dir, exist_ok=True)
                 
-                stats[cluster_dir_name] = {
-                    "count": len(cluster_points),
-                    "items": []
-                }
+                # Prepare download tasks
+                logger.info(f"Preparing concurrent download (workers={self.max_workers}, mode={self.download_mode})...")
+                download_tasks = []
                 
-                for item in cluster_points:
-                    point_id = item["point_id"]
-                    minio_url = item["minio_url"]
+                for label, cluster_points in sorted(clusters.items()):
+                    cluster_dir_name = "noise" if label == -1 else f"cluster_{label}"
+                    cluster_path = os.path.join(self.output_dir, cluster_dir_name)
+                    os.makedirs(cluster_path, exist_ok=True)
                     
-                    # Check match status
-                    is_match = False
-                    if verification_stats and point_id in verification_stats["results"]:
-                        is_match = verification_stats["results"][point_id]["is_match"]
-                        
-                    # Decide if we need to download
-                    should_download = False
-                    if self.download_mode == "all":
-                        should_download = True
-                    elif self.download_mode == "matched_only":
-                        should_download = is_match
-                    # 'none' mode means should_download remains False
+                    stats[cluster_dir_name] = {"count": len(cluster_points), "items": []}
                     
-                    item["local_path"] = None
+                    for item in cluster_points:
+                        point_id = item["point_id"]
+                        is_match = False
+                        if verification_stats and point_id in verification_stats["results"]:
+                            is_match = verification_stats["results"][point_id]["is_match"]
+                        
+                        # Decide if we need to download
+                        should_download = False
+                        if self.download_mode == "all":
+                            should_download = True
+                        elif self.download_mode == "matched_only":
+                            should_download = is_match
+                        
+                        item["local_path"] = None
+                        
+                        if should_download:
+                            download_tasks.append((item, cluster_path, is_match))
+                        
+                        stats[cluster_dir_name]["items"].append(item)
+                
+                # Execute concurrent downloads
+                logger.info(f"Downloading {len(download_tasks)} images concurrently...")
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    futures = {}
+                    for task_item, task_path, task_is_match in download_tasks:
+                        future = executor.submit(
+                            self._download_and_process_item,
+                            task_item, task_path, task_is_match, match_dest_dir
+                        )
+                        futures[future] = task_item
                     
-                    if should_download:
-                        _, object_name = self.minio_client.parse_minio_url(minio_url)
-                        filename = object_name.split('/')[-1]
-                        
-                        short_id = str(point_id)[:8]
-                        dest_filename = f"{short_id}_{filename}"
-                        dest_path = os.path.join(cluster_path, dest_filename)
-                        
-                        # Download image
-                        success = self.minio_client.download_face_image(minio_url, dest_path)
-                        if success:
-                            total_downloaded += 1
-                            
-                            # Apply color normalization if enabled
-                            if self.normalize_enabled and self.normalizer:
-                                if self.normalize_overwrite:
-                                    if self.normalizer.transform_file(dest_path, dest_path):
-                                        logger.info(f"Normalized and overwrote image: {dest_path}")
-                                else:
-                                    norm_filename = f"{short_id}_normalized_{filename}"
-                                    norm_dest_path = os.path.join(cluster_path, norm_filename)
-                                    if self.normalizer.transform_file(dest_path, norm_dest_path):
-                                        logger.info(f"Normalized image saved to: {norm_dest_path}")
-                                        dest_path = norm_dest_path
-                                        
-                            item["local_path"] = dest_path
-                            
-                            # Copy to matches folder if it is a match
-                            if is_match and match_dest_dir:
-                                shutil.copy2(dest_path, os.path.join(match_dest_dir, os.path.basename(dest_path)))
-                        else:
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        try:
+                            dest_path, success = future.result()
+                            if success:
+                                item["local_path"] = dest_path
+                                total_downloaded += 1
+                            else:
+                                total_failed += 1
+                        except Exception as e:
+                            logger.error(f"Download task error for {item['point_id']}: {e}")
                             total_failed += 1
-                            
-                    stats[cluster_dir_name]["items"].append(item)
+            else:
+                # DOWNLOAD_IMAGES=0 — analysis only, no downloads
+                logger.info("DOWNLOAD_IMAGES=0 — Running analysis only (no image download).")
+                for label, cluster_points in sorted(clusters.items()):
+                    cluster_dir_name = "noise" if label == -1 else f"cluster_{label}"
+                    stats[cluster_dir_name] = {"count": len(cluster_points), "items": []}
+                    for item in cluster_points:
+                        item["local_path"] = None
+                        stats[cluster_dir_name]["items"].append(item)
             
             # 7. Generate final reports
             end_time = datetime.now()
@@ -249,6 +313,7 @@ class FaceIDNormalizeApp:
             
             logger.info("==========================================================")
             logger.info(f"Pipeline finished successfully in {duration:.2f} seconds.")
+            logger.info(f"Download enabled: {self.download_images}")
             logger.info(f"Total downloaded: {total_downloaded}")
             logger.info(f"Total failed: {total_failed}")
             logger.info(f"Clusters found: {len(clusters) - (1 if -1 in clusters else 0)}")
@@ -283,6 +348,7 @@ class FaceIDNormalizeApp:
                 "duration_seconds": duration,
                 "downloaded": downloaded,
                 "failed": failed,
+                "download_enabled": self.download_images,
                 "download_mode": self.download_mode
             }
         }
@@ -298,7 +364,7 @@ class FaceIDNormalizeApp:
                 f.write("# Báo Cáo Kết Quả Phân Cụm & Đối Khớp FaceID\n\n")
                 f.write(f"- **Thời gian chạy**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
                 f.write(f"- **Thời gian xử lý**: {duration:.2f} giây\n")
-                f.write(f"- **Chế độ tải ảnh**: `{self.download_mode}`\n")
+                f.write(f"- **Chế độ tải ảnh**: `{'enabled' if self.download_images else 'disabled'}` (mode: `{self.download_mode}`)\n")
                 f.write(f"- **Tổng số ảnh tải thành công**: {downloaded}\n")
                 f.write(f"- **Số ảnh lỗi**: {failed}\n")
                 f.write(f"- **Cấu hình HDBSCAN**:\n")
@@ -311,14 +377,14 @@ class FaceIDNormalizeApp:
                     f.write("## 1. Kết Quả Xác Thực FaceID & Hiệu Chỉnh Miền\n\n")
                     f.write(f"- **Ảnh chuẩn sử dụng**: `{self.ref_image_path}`\n")
                     f.write(f"- **Cụm đại diện nhận diện tự động**: `{verification_stats['target_folder']}`\n")
-                    f.write(f"- **Độ dài Vector dịch chuyển miền ($\Delta v$ norm)**: {verification_stats['delta_v_norm']:.4f}\n")
-                    f.write(f"- **Hệ số hiệu chỉnh tịnh tiến ($\alpha$)**: {self.verify_calibration_alpha}\n")
+                    f.write(f"- **Độ dài Vector dịch chuyển miền ($\\Delta v$ norm)**: {verification_stats['delta_v_norm']:.4f}\n")
+                    f.write(f"- **Hệ số hiệu chỉnh tịnh tiến ($\\alpha$)**: {self.verify_calibration_alpha}\n")
                     f.write(f"- **Ngưỡng nhận diện đối khớp**: {self.verify_threshold}\n")
                     f.write(f"- **Tổng số ảnh trùng khớp tìm thấy**: **{verification_stats['matches_count']}**\n")
-                    if self.download_mode != "none":
+                    if self.download_images and self.download_mode != "none":
                         f.write(f"- **Thư mục lưu ảnh khớp**: `data/matches/{os.path.splitext(os.path.basename(self.ref_image_path))[0]}/`\n\n")
                     else:
-                        f.write("- **Thư mục lưu ảnh khớp**: `N/A` (Chế độ `none` không tải ảnh)\n\n")
+                        f.write("- **Thư mục lưu ảnh khớp**: `N/A` (Download disabled hoặc chế độ `none`)\n\n")
                     
                     # Top 10 matches table
                     f.write("### Top 10 Ảnh Có Độ Tương Đồng Cao Nhất Sau Hiệu Chỉnh\n\n")

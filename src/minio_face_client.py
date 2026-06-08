@@ -113,3 +113,30 @@ class MinioFaceClient:
         except Exception as e:
             logger.error(f"Error downloading object '{object_name}' from bucket '{bucket_name}': {e}")
             return False
+
+    def download_to_memory(self, minio_url: str) -> Optional[bytes]:
+        """
+        Downloads the image into memory buffer instead of writing to disk.
+        Used for in-memory processing pipeline (normalize → write once).
+        
+        Args:
+            minio_url: URL to the file in MinIO.
+            
+        Returns:
+            bytes: Raw image data, or None if download failed.
+        """
+        if not self.client:
+            raise ConnectionError("MinIO client is not connected.")
+            
+        bucket_name, object_name = self.parse_minio_url(minio_url)
+        
+        try:
+            logger.debug(f"Downloading '{object_name}' from bucket '{bucket_name}' to memory...")
+            response = self.client.get_object(bucket_name, object_name)
+            data = response.read()
+            response.close()
+            response.release_conn()
+            return data
+        except Exception as e:
+            logger.error(f"Error downloading '{object_name}' to memory: {e}")
+            return None
