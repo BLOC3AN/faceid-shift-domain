@@ -30,9 +30,11 @@ def main():
     
     quality_min_score = float(os.getenv("QUALITY_MIN_SCORE", "0.4"))
     quality_good_score = float(os.getenv("QUALITY_GOOD_SCORE", "0.7"))
-    verify_threshold_high = float(os.getenv("FACE_VERIFY_THRESHOLD_HIGH", "0.70"))
-    verify_threshold_standard = float(os.getenv("FACE_VERIFY_THRESHOLD_STANDARD", "0.60"))
-    verify_threshold_default = float(os.getenv("FACE_VERIFY_THRESHOLD", "0.65"))
+    
+    # CCTV Live Stream optimized verification thresholds (adjusted due to Domain Shift without translation)
+    verify_threshold_high = 0.45
+    verify_threshold_standard = 0.38
+    verify_threshold_default = 0.42
 
     output_match_dir = os.path.join(project_root, "data/stream_matches")
     os.makedirs(output_match_dir, exist_ok=True)
