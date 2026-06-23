@@ -8,13 +8,14 @@ from datetime import datetime
 from dotenv import load_dotenv
 from insightface.app import FaceAnalysis
 
-# Add project root and src to python path
-project_root = "/home/hailt/Desktop/faceID_normalize"
-sys.path.append(project_root)
-sys.path.append(os.path.join(project_root, "src"))
+# Add project root to python path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)
+if project_root not in sys.path:
+    sys.path.append(project_root)
 
-from quality_gate import FaceQualityGate
-from face_id_verifier import FaceIDVerifier
+from faceid.core.quality_gate import FaceQualityGate
+from faceid.core.verifier import FaceIDVerifier
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

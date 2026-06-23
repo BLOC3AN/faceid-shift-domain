@@ -1,0 +1,11 @@
+opencv-python
+insightface
+onnxruntime
+numpy
+redis
+qdrant-client
+minio
+scikit-image
+python-dotenv
+hdbscan
+scikit-learn

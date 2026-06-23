@@ -12,19 +12,23 @@ Hệ thống FaceID công nghiệp tích hợp cổng kiểm soát chất lượ
 │   └── stream_matches/         # Lưu ảnh gốc và ảnh cropped khuôn mặt khi so khớp thành công trực tiếp
 ├── docs/                       # Tài liệu thiết kế và kế hoạch nghiên cứu
 ├── models/                     # Thư mục chứa mô hình ONNX của InsightFace (buffalo_m) (đã ignore)
-├── src/                        # Thư mục mã nguồn chính
-│   ├── clustering.py           # Module phân cụm ảnh khuôn mặt (HDBSCAN)
-│   ├── face_id_verifier.py     # Module core xác thực FaceID và tính toán hiệu chỉnh miền đặc trưng
-│   ├── main.py                 # Pipeline offline (MinIO -> Quality Gate -> Clustering -> Verification -> Report)
-│   ├── minio_face_client.py    # Client tương tác dữ liệu ảnh với MinIO
-│   ├── qdrant_face_client.py   # Client truy vấn vector đặc trưng với Qdrant
-│   ├── quality_gate.py         # Bộ lọc chất lượng khuôn mặt (Blur, Light, Pitch, Yaw, Roll)
-│   ├── redis_client.py         # Client quản lý RAM cache cho embedding chuẩn
-│   └── stream_verifier.py      # Script nhận diện thời gian thực từ camera RTSP (hỗ trợ Substream)
-├── utils/                      # Thư mục tiện ích
-│   └── color_normalizer.py     # Module chuẩn hóa màu sắc và phân phối ánh sáng (Reinhard, CLAHE)
+├── faceid/                     # Package chính của dự án
+│   ├── clients/                # Tầng kết nối dịch vụ ngoài (MinIO, Qdrant, Redis)
+│   │   ├── minio_client.py
+│   │   ├── qdrant_client.py
+│   │   └── redis_client.py
+│   ├── core/                   # Tầng logic nghiệp vụ cốt lõi
+│   │   ├── clustering.py       # HDBSCAN clustering
+│   │   ├── quality_gate.py     # Bộ lọc chất lượng ảnh khuôn mặt
+│   │   └── verifier.py         # FaceID Verifier & Domain Calibration
+│   └── utils/                  # Tầng tiện ích dùng chung
+│       └── color_normalizer.py # Reinhard & Histogram color normalizer
+├── scripts/                    # Entrypoints (Script chạy)
+│   ├── run_pipeline.py         # Offline pipeline (Clustering -> Verification -> Report)
+│   └── run_stream.py           # RTSP live stream verifier
 ├── .env                        # File cấu hình môi trường dự án (đã ignore)
-└── .gitignore                  # File cấu hình Git ignore
+├── .gitignore                  # File cấu hình Git ignore
+└── requirements.txt            # File quản lý thư viện dependencies
 ```
 
 ---
@@ -104,17 +108,17 @@ DOWNLOAD_IMAGES=1
 
 ## 🚀 Hướng dẫn Chạy Chương trình
 
-### Luồng 1: Xử lý và Phân cụm Offline (`src/main.py`)
+### Luồng 1: Xử lý và Phân cụm Offline (`scripts/run_pipeline.py`)
 Dùng để tải ảnh hàng loạt từ MinIO, lọc chất lượng, phân cụm, tính toán dịch chuyển miền đặc trưng (Domain Calibration) và xuất báo cáo markdown thống kê kết quả.
 ```bash
-python3 src/main.py
+python3 scripts/run_pipeline.py
 ```
 *Kết quả:* Báo cáo thống kê chi tiết được xuất tại `data/verification_report_<timestamp>.md`.
 
-### Luồng 2: Nhận diện trực tiếp từ Camera RTSP (`src/stream_verifier.py`)
+### Luồng 2: Nhận diện trực tiếp từ Camera RTSP (`scripts/run_stream.py`)
 Dùng để đọc trực tiếp luồng video từ camera, phát hiện và verify nhân sự thời gian thực:
 ```bash
-python3 src/stream_verifier.py
+python3 scripts/run_stream.py
 ```
 
 💡 **Các tính năng nổi bật của luồng RTSP Live:**

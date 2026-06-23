@@ -11,20 +11,18 @@ from typing import Optional, Dict, List, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
-# Add src directory to python path
-src_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(src_dir)
-if src_dir not in sys.path:
-    sys.path.append(src_dir)
+# Add project root to python path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from qdrant_face_client import QdrantFaceClient
-from minio_face_client import MinioFaceClient
-from redis_client import RedisCacheClient
-from clustering import FaceClustering
-from utils.color_normalizer import FaceImageNormalizer
-from face_id_verifier import FaceIDVerifier
+from faceid.clients.qdrant_client import QdrantFaceClient
+from faceid.clients.minio_client import MinioFaceClient
+from faceid.clients.redis_client import RedisCacheClient
+from faceid.core.clustering import FaceClustering
+from faceid.utils.color_normalizer import FaceImageNormalizer
+from faceid.core.verifier import FaceIDVerifier
 
 # Load environment variables
 load_dotenv()

@@ -5,7 +5,7 @@ import numpy as np
 import logging
 from typing import Dict, List, Any, Optional, Tuple
 from insightface.app import FaceAnalysis
-from redis_client import RedisCacheClient
+from faceid.clients.redis_client import RedisCacheClient
 
 logger = logging.getLogger("FaceClustering.FaceIDVerifier")
 
