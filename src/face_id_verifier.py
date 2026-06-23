@@ -19,6 +19,10 @@ class FaceIDVerifier:
         ref_image_path: str, 
         model_root: str = ".", 
         verify_threshold: float = 0.65,
+        verify_threshold_high: float = 0.70,
+        verify_threshold_standard: float = 0.60,
+        quality_min_score: float = 0.40,
+        quality_good_score: float = 0.70,
         calibration_enabled: bool = True,
         calibration_alpha: float = 0.6,
         redis_client: Optional[RedisCacheClient] = None
@@ -26,6 +30,10 @@ class FaceIDVerifier:
         self.ref_image_path = ref_image_path
         self.model_root = model_root
         self.verify_threshold = verify_threshold
+        self.verify_threshold_high = verify_threshold_high
+        self.verify_threshold_standard = verify_threshold_standard
+        self.quality_min_score = quality_min_score
+        self.quality_good_score = quality_good_score
         self.calibration_enabled = calibration_enabled
         self.calibration_alpha = calibration_alpha
         
@@ -113,21 +121,33 @@ class FaceIDVerifier:
             return 0.0
         return float(dot_product / (norm_v1 * norm_v2))
 
-    def verify_vectors(self, clusters: Dict[int, List[Dict[str, Any]]]) -> Dict[str, Any]:
+    def verify_vectors(
+        self, 
+        clusters: Dict[int, List[Dict[str, Any]]],
+        point_qualities: Optional[Dict[str, Dict[str, Any]]] = None
+    ) -> Dict[str, Any]:
         """
-        Runs vectorized verification on cluster embeddings in RAM using batch numpy ops.
+        Runs vectorized verification on cluster embeddings in RAM using batch numpy ops,
+        applying adaptive thresholding based on face image quality metrics if provided.
         
         Args:
             clusters: Dict mapping label (int) -> list of item dicts containing:
                       - "point_id"
                       - "vector"
+            point_qualities: Dict mapping point_id -> Dict of quality metrics.
         
         Returns:
             Dict containing:
                 - "target_folder": Name of the folder representing the target cluster
                 - "delta_v_norm": Norm of the calculated translation vector
                 - "matches_count": Total count of verified matches
-                - "results": Dict mapping point_id -> {"similarity": float, "is_match": bool}
+                - "results": Dict mapping point_id -> {
+                                 "similarity": float, 
+                                 "is_match": bool,
+                                 "quality_score": float,
+                                 "quality_valid": bool,
+                                 "status": str
+                             }
         """
         logger.info("Running vectorized FaceID verification on Qdrant vectors in RAM...")
         
@@ -192,16 +212,43 @@ class FaceIDVerifier:
         else:
             final_sims = raw_sims
         
-        # Batch threshold check
-        is_match_arr = final_sims >= self.verify_threshold
-        matches_count = int(np.sum(is_match_arr))
-        
-        # Build results map
+        # Adaptive Threshold checking
         results_map = {}
+        matches_count = 0
+        
         for i, point_id in enumerate(all_ids):
+            similarity = float(final_sims[i])
+            
+            # Check quality metrics if provided
+            if point_qualities and point_id in point_qualities:
+                q_info = point_qualities[point_id]
+                q_score = q_info.get("quality_score", 1.0)
+                is_valid = q_info.get("is_valid", True)
+                
+                if not is_valid or q_score < self.quality_min_score:
+                    is_match = False
+                    status = f"REJECTED (Low Quality: {q_score:.2f} < {self.quality_min_score})"
+                else:
+                    # Choose adaptive threshold: standard threshold if good, high threshold if medium
+                    threshold = self.verify_threshold_standard if q_score >= self.quality_good_score else self.verify_threshold_high
+                    is_match = similarity >= threshold
+                    status = f"MATCHED (Similarity: {similarity:.4f} >= {threshold})" if is_match else f"FAILED (Similarity: {similarity:.4f} < {threshold})"
+            else:
+                # Fallback to static threshold
+                is_match = similarity >= self.verify_threshold
+                status = f"MATCHED (Similarity: {similarity:.4f} >= {self.verify_threshold})" if is_match else f"FAILED (Similarity: {similarity:.4f} < {self.verify_threshold})"
+                q_score = 1.0
+                is_valid = True
+                
+            if is_match:
+                matches_count += 1
+                
             results_map[point_id] = {
-                "similarity": float(final_sims[i]),
-                "is_match": bool(is_match_arr[i])
+                "similarity": similarity,
+                "is_match": is_match,
+                "quality_score": q_score,
+                "quality_valid": is_valid,
+                "status": status
             }
         
         logger.info(f"Verification mathematical analysis completed. Total matches found: {matches_count}.")

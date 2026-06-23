@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 from datetime import datetime
 from collections import defaultdict
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
@@ -74,6 +74,13 @@ class FaceIDNormalizeApp:
         self.verify_calibration_enabled = os.getenv("FACE_VERIFY_CALIBRATION_ENABLED", "0") == "1"
         self.verify_calibration_alpha = float(os.getenv("FACE_VERIFY_CALIBRATION_ALPHA", "0.6"))
         
+        # Load Quality Gate & Adaptive Threshold settings
+        self.quality_gate_enabled = os.getenv("QUALITY_GATE_ENABLED", "0") == "1"
+        self.quality_min_score = float(os.getenv("QUALITY_MIN_SCORE", "0.4"))
+        self.quality_good_score = float(os.getenv("QUALITY_GOOD_SCORE", "0.7"))
+        self.verify_threshold_high = float(os.getenv("FACE_VERIFY_THRESHOLD_HIGH", "0.70"))
+        self.verify_threshold_standard = float(os.getenv("FACE_VERIFY_THRESHOLD_STANDARD", "0.60"))
+        
         # Load download settings
         self.download_images = os.getenv("DOWNLOAD_IMAGES", "1") == "1"
         self.download_mode = os.getenv("DOWNLOAD_IMAGES_MODE", "all")
@@ -93,6 +100,21 @@ class FaceIDNormalizeApp:
                 logger.error(f"Failed to initialize normalizer: {e}. Normalization disabled.")
                 self.normalize_enabled = False
                 
+        # Initialize Quality Gate if enabled
+        self.quality_gate = None
+        if self.quality_gate_enabled:
+            try:
+                from quality_gate import FaceQualityGate
+                self.quality_gate = FaceQualityGate(
+                    model_root=".",
+                    min_score=self.quality_min_score,
+                    good_score=self.quality_good_score
+                )
+                logger.info("Face quality gate initialized successfully.")
+            except Exception as e:
+                logger.error(f"Failed to initialize Quality Gate: {e}. Quality Gate disabled.")
+                self.quality_gate_enabled = False
+                
         # Initialize shared Redis client
         self.redis_client = RedisCacheClient()
         
@@ -104,6 +126,10 @@ class FaceIDNormalizeApp:
                     ref_image_path=self.ref_image_path,
                     model_root=".",
                     verify_threshold=self.verify_threshold,
+                    verify_threshold_high=self.verify_threshold_high,
+                    verify_threshold_standard=self.verify_threshold_standard,
+                    quality_min_score=self.quality_min_score,
+                    quality_good_score=self.quality_good_score,
                     calibration_enabled=self.verify_calibration_enabled,
                     calibration_alpha=self.verify_calibration_alpha,
                     redis_client=self.redis_client
@@ -122,11 +148,57 @@ class FaceIDNormalizeApp:
             metric=self.metric
         )
 
+    def _evaluate_item_quality(self, item: dict) -> Tuple[str, Dict[str, Any]]:
+        """
+        Downloads image from MinIO to memory and evaluates quality.
+        Caches BGR image in the item dict to avoid download duplication.
+        """
+        minio_url = item["minio_url"]
+        point_id = item["point_id"]
+        
+        try:
+            # Download to memory (avoid disk I/O)
+            data = self.minio_client.download_to_memory(minio_url)
+            if data is None:
+                return point_id, {
+                    "quality_score": 0.0, 
+                    "is_valid": False, 
+                    "reason": "Download failed", 
+                    "metrics": {}
+                }
+            
+            # Decode in memory
+            img_array = np.frombuffer(data, np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            if img is None:
+                return point_id, {
+                    "quality_score": 0.0, 
+                    "is_valid": False, 
+                    "reason": "Decode failed", 
+                    "metrics": {}
+                }
+            
+            # Cache image in RAM for subsequent processing
+            item["image_bgr"] = img
+            
+            # Evaluate using Quality Gate
+            quality_info = self.quality_gate.evaluate(img)
+            return point_id, quality_info
+            
+        except Exception as e:
+            logger.error(f"Error evaluating quality for point {point_id}: {e}")
+            return point_id, {
+                "quality_score": 0.0, 
+                "is_valid": False, 
+                "reason": f"Exception: {str(e)}", 
+                "metrics": {}
+            }
+
     def _download_and_process_item(
         self, item: dict, cluster_path: str, is_match: bool, match_dest_dir: Optional[str]
     ) -> tuple:
         """
-        Download image to memory, normalize in-memory, write once to disk.
+        Download image to memory (if not cached), normalize in-memory, write once to disk.
         Thread-safe — each call operates on independent file paths.
         
         Returns:
@@ -145,17 +217,20 @@ class FaceIDNormalizeApp:
             # Lazy directory creation (only when actually downloading)
             os.makedirs(cluster_path, exist_ok=True)
             
-            # Download to memory (avoid intermediate disk write)
-            data = self.minio_client.download_to_memory(minio_url)
-            if data is None:
-                return None, False
+            # Retrieve cached image from Quality Gate step to avoid re-download
+            img = item.get("image_bgr")
             
-            # Decode image in memory
-            img_array = np.frombuffer(data, np.uint8)
-            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
             if img is None:
-                logger.error(f"Failed to decode image from {minio_url}")
-                return None, False
+                # Fallback: Download if not already cached
+                data = self.minio_client.download_to_memory(minio_url)
+                if data is None:
+                    return None, False
+                # Decode image in memory
+                img_array = np.frombuffer(data, np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                if img is None:
+                    logger.error(f"Failed to decode image from {minio_url}")
+                    return None, False
             
             # Apply normalization in memory if enabled
             if self.normalize_enabled and self.normalizer:
@@ -177,6 +252,10 @@ class FaceIDNormalizeApp:
             # Copy to matches folder if matched
             if is_match and match_dest_dir:
                 shutil.copy2(dest_path, os.path.join(match_dest_dir, os.path.basename(dest_path)))
+            
+            # Clear memory cache after write to release RAM
+            if "image_bgr" in item:
+                del item["image_bgr"]
             
             return dest_path, True
             
@@ -229,10 +308,37 @@ class FaceIDNormalizeApp:
                     "vector": valid_points[idx]["vector"]
                 })
             
-            # 5. Perform Face ID verification on vectors in RAM (vectorized numpy)
+            # 5. Run Quality Gate evaluation concurrently if enabled
+            point_qualities = {}
+            if self.quality_gate_enabled and self.quality_gate:
+                logger.info("Quality Gate is enabled. Evaluating image quality for all points concurrently...")
+                
+                flat_items = []
+                for label, cluster_points in clusters.items():
+                    for item in cluster_points:
+                        flat_items.append(item)
+                
+                # Execute quality evaluations concurrently using ThreadPoolExecutor
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    futures = {
+                        executor.submit(self._evaluate_item_quality, item): item 
+                        for item in flat_items
+                    }
+                    
+                    for future in as_completed(futures):
+                        point_id, q_info = future.result()
+                        point_qualities[point_id] = q_info
+                        if not q_info["is_valid"]:
+                            logger.warning(f"Point {point_id[:8]} REJECTED by Quality Gate: {q_info['reason']}")
+                        else:
+                            logger.info(f"Point {point_id[:8]} PASSED Quality Gate. Score: {q_info['quality_score']:.4f}")
+            else:
+                logger.info("Quality Gate is disabled.")
+            
+            # 6. Perform Face ID verification on vectors in RAM using point qualities for adaptive thresholds
             verification_stats = None
             if self.verify_enabled and self.verifier:
-                verification_stats = self.verifier.verify_vectors(clusters)
+                verification_stats = self.verifier.verify_vectors(clusters, point_qualities)
                 
             # 6. Process cluster results and selectively download files
             stats = {}
@@ -276,6 +382,9 @@ class FaceIDNormalizeApp:
                         
                         if should_download:
                             download_tasks.append((item, cluster_path, is_match))
+                        else:
+                            # Clean up BGR image from memory immediately if not downloading to avoid JSON serialization errors
+                            item.pop("image_bgr", None)
                         
                         stats[cluster_dir_name]["items"].append(item)
                 
@@ -403,27 +512,35 @@ class FaceIDNormalizeApp:
                     
                     # Top 10 matches table
                     f.write("### Top 10 Ảnh Có Độ Tương Đồng Cao Nhất Sau Hiệu Chỉnh\n\n")
-                    f.write("| # | Cụm | Point ID | Tên File Local | Độ Tương Đồng | Trạng Thái |\n")
-                    f.write("| :---: | :---: | :--- | :--- | :---: | :---: |")
+                    f.write("| # | Cụm | Point ID | Tên File Local | Độ Tương Đồng | Chất Lượng | Trạng Thái |\n")
+                    f.write("| :---: | :---: | :--- | :--- | :---: | :---: | :---: |")
                     
                     all_matched_items = []
                     for folder_name, info in stats.items():
                         for item in info["items"]:
                             point_id = item["point_id"]
-                            res = verification_stats["results"].get(point_id, {"similarity": 0.0, "is_match": False})
+                            res = verification_stats["results"].get(point_id, {
+                                "similarity": 0.0, "is_match": False, "quality_score": 1.0, "quality_valid": True, "status": "UNKNOWN"
+                            })
                             all_matched_items.append({
                                 "folder": folder_name,
                                 "point_id": point_id,
                                 "local_path": item["local_path"],
                                 "similarity": res["similarity"],
-                                "is_match": res["is_match"]
+                                "is_match": res["is_match"],
+                                "quality_score": res.get("quality_score", 1.0),
+                                "quality_valid": res.get("quality_valid", True),
+                                "status": res.get("status", "UNKNOWN")
                             })
                     all_matched_items = sorted(all_matched_items, key=lambda x: x["similarity"], reverse=True)
                     
                     for idx, item in enumerate(all_matched_items[:10]):
                         status = "✅ KHỚP (Duong)" if item["is_match"] else "❌ KHÔNG KHỚP"
+                        if "REJECTED" in item["status"]:
+                            status = "⚠️ BỊ LOẠI (Chất lượng kém)"
                         filename = os.path.basename(item["local_path"]) if item["local_path"] else "Not Downloaded"
-                        f.write(f"\n| {idx+1} | `{item['folder']}` | `{item['point_id'][:8]}` | `{filename}` | {item['similarity']:.4f} | {status} |")
+                        q_str = f"{item['quality_score']:.2f} ({'Pass' if item['quality_valid'] else 'Fail'})"
+                        f.write(f"\n| {idx+1} | `{item['folder']}` | `{item['point_id'][:8]}` | `{filename}` | {item['similarity']:.4f} | {q_str} | {status} |")
                     f.write("\n\n")
                 
                 # Clustering statistics section
@@ -460,11 +577,11 @@ class FaceIDNormalizeApp:
                     f.write(f"### {folder_name.upper()} ({info['count']} ảnh)\n\n")
                     f.write("| Point ID | Tên File Local |")
                     if verification_stats:
-                        f.write(" Độ Tương Đồng (Đã hiệu chỉnh) | Trạng Thái |")
+                        f.write(" Độ Tương Đồng (Đã hiệu chỉnh) | Chất Lượng | Trạng Thái |")
                     f.write(" MinIO URL |\n")
                     f.write("| :--- | :--- |")
                     if verification_stats:
-                        f.write(" :---: | :---: |")
+                        f.write(" :---: | :---: | :---: |")
                     f.write(" :--- |\n")
                     
                     for item in info["items"]:
@@ -472,9 +589,13 @@ class FaceIDNormalizeApp:
                         filename = os.path.basename(item["local_path"]) if item["local_path"] else "Not Downloaded"
                         f.write(f"| `{point_id}` | `{filename}` |")
                         if verification_stats:
-                            res = verification_stats["results"].get(point_id, {"similarity": 0.0, "is_match": False})
-                            status = "Match" if res["is_match"] else "No Match"
-                            f.write(f" {res['similarity']:.4f} | {status} |")
+                            res = verification_stats["results"].get(point_id, {
+                                "similarity": 0.0, "is_match": False, "quality_score": 1.0, "quality_valid": True, "status": "UNKNOWN"
+                            })
+                            q_score = res.get("quality_score", 1.0)
+                            q_valid = res.get("quality_valid", True)
+                            q_str = f"{q_score:.2f} ({'Pass' if q_valid else 'Fail'})"
+                            f.write(f" {res['similarity']:.4f} | {q_str} | {res['status']} |")
                         f.write(f" [Link]({item['minio_url']}) |\n")
                     f.write("\n")
                     
