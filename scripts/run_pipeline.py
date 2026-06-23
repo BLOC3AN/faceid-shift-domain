@@ -102,7 +102,7 @@ class FaceIDNormalizeApp:
         self.quality_gate = None
         if self.quality_gate_enabled:
             try:
-                from quality_gate import FaceQualityGate
+                from faceid.core.quality_gate import FaceQualityGate
                 self.quality_gate = FaceQualityGate(
                     model_root=".",
                     min_score=self.quality_min_score,
