@@ -24,7 +24,7 @@ def main():
     load_dotenv(os.path.join(project_root, ".env"))
 
     # Configs
-    rtsp_url = "rtsp://admin:admin_123@192.168.1.103:1904/stream"
+    rtsp_url = os.getenv("RTSP_URL", "rtsp://admin:admin_123@192.168.1.103:1904/stream2")
     ref_image_path = os.path.join(project_root, os.getenv("FACE_REF_IMAGE_PATH", "data/_face_ID/duong_cropped.jpg"))
     model_root = project_root
     
@@ -173,10 +173,16 @@ def main():
                 name_tag = f"Duong (Sim: {similarity:.2f}, Q: {q_score:.2f})"
                 logger.info(f"[MATCH] Duong detected! Sim: {similarity:.4f} >= Thresh: {threshold} (Q: {q_score:.2f})")
                 
-                # Save matching frame for record
+                # Save matching frame and cropped face for record
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
                 match_filename = f"duong_{timestamp}.jpg"
                 cv2.imwrite(os.path.join(output_match_dir, match_filename), frame)
+                
+                cropped_dir = os.path.join(output_match_dir, "cropped")
+                os.makedirs(cropped_dir, exist_ok=True)
+                crop_filename = f"duong_{timestamp}_crop.jpg"
+                cv2.imwrite(os.path.join(cropped_dir, crop_filename), face_crop)
+                logger.info(f"Saved matching frame and cropped face: {match_filename} & {crop_filename}")
             else:
                 # UNKNOWN - draw Red Box
                 color = (0, 0, 255)
